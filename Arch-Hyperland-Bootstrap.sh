@@ -3,8 +3,8 @@ set -euo pipefail
 
 # ============================================================
 # Hyprland desktop bootstrap for Arch Linux
-# Stages 0-8b: base tools -> Hyprland -> DM -> configs -> wallpaper tool
-#              -> keybind reference menu
+# Stages 0-9: base tools -> Hyprland -> Plymouth+LUKS -> configs
+#             -> wallpaper tool -> keybind reference menu
 # Review before running. Designed to be safe to re-run (idempotent
 # where practical) if a stage fails partway through.
 # ============================================================
@@ -12,10 +12,12 @@ set -euo pipefail
 BOLD="\033[1m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
+RED="\033[31m"
 RESET="\033[0m"
 
 log()  { echo -e "${BOLD}${GREEN}==>${RESET} $1"; }
 warn() { echo -e "${BOLD}${YELLOW}!!${RESET} $1"; }
+err()  { echo -e "${BOLD}${RED}XX${RESET} $1"; }
 
 confirm() {
   read -rp "$1 [y/N] " ans
@@ -62,17 +64,15 @@ sudo pacman -S --needed --noconfirm \
   brightnessctl playerctl
 
 if [ ! -f /usr/share/wayland-sessions/hyprland.desktop ]; then
-  warn "hyprland.desktop session file not found - display manager won't see Hyprland."
+  warn "hyprland.desktop session file not found."
   warn "This usually resolves after reinstalling the hyprland package cleanly."
 fi
 
 # --- Checkpoint: verify Hyprland actually launches before going further ---
 echo
 warn "CHECKPOINT: Before continuing, you should verify Hyprland launches cleanly."
-echo "This script can attempt to launch it now in the foreground."
 echo "You will be dropped into a bare Hyprland session with no bar/launcher yet -"
-echo "that's expected. Exit with 'hyprctl dispatch exit' or SUPER+M once confirmed,"
-echo "and the script will resume automatically."
+echo "that's expected. Exit with 'hyprctl dispatch exit' or SUPER+M once confirmed."
 echo
 if confirm "Launch 'Hyprland' now to test?"; then
   set +e
@@ -131,26 +131,23 @@ sudo systemctl enable --now NetworkManager
 sudo systemctl enable --now bluetooth
 
 # ------------------------------------------------------------
-# Stage 5: SDDM + theme
+# Stage 5: Remove SDDM (replaced by Plymouth + TTY autologin)
 # ------------------------------------------------------------
-log "Stage 5: SDDM login manager"
-sudo pacman -S --needed --noconfirm sddm
+log "Stage 5: Removing SDDM and its theme"
 
-log "Installing sddm-astronaut-theme (AUR)"
-if ! yay -S --noconfirm sddm-astronaut-theme; then
-  warn "sddm-astronaut-theme failed to build."
-  warn "You can install an alternative manually later, e.g.: yay -S sddm-sugar-candy-git"
-fi
-
-sudo mkdir -p /etc/sddm.conf.d
-if [ -d /usr/share/sddm/themes/sddm-astronaut-theme ]; then
-  echo -e "[Theme]\nCurrent=sddm-astronaut-theme" | sudo tee /etc/sddm.conf.d/theme.conf >/dev/null
-  log "SDDM theme set to sddm-astronaut-theme"
+if pacman -Qi sddm &>/dev/null; then
+  sudo systemctl disable sddm --now || true
+  sudo pacman -Rns --noconfirm sddm || warn "sddm removal reported an issue - check manually"
 else
-  warn "Theme directory not found, skipping SDDM theme config. Set it manually later."
+  log "sddm not installed, skipping removal"
 fi
 
-sudo systemctl enable sddm
+if pacman -Qi sddm-astronaut-theme &>/dev/null; then
+  sudo pacman -Rns --noconfirm sddm-astronaut-theme || true
+fi
+
+sudo rm -rf /etc/sddm.conf.d
+log "SDDM removed."
 
 # ------------------------------------------------------------
 # Stage 6: Shared wallpaper location + initial background
@@ -169,15 +166,6 @@ if [ -n "$WALLPAPER_SRC" ] && [ -f "$WALLPAPER_SRC" ]; then
   log "Wallpaper set: $WALLPAPER_TARGET"
 else
   warn "No wallpaper set yet. Copy one manually later to $WALLPAPER_TARGET"
-fi
-
-if [ -d /usr/share/sddm/themes/sddm-astronaut-theme ] && [ -f "$WALLPAPER_TARGET" ]; then
-  THEME_CONF="/usr/share/sddm/themes/sddm-astronaut-theme/theme.conf"
-  if [ -f "$THEME_CONF" ]; then
-    sudo sed -i "s|^Background=.*|Background=\"$WALLPAPER_TARGET\"|" "$THEME_CONF" || \
-      warn "Could not auto-edit theme.conf Background line. Edit manually: $THEME_CONF"
-    log "SDDM theme background pointed at $WALLPAPER_TARGET"
-  fi
 fi
 
 # ------------------------------------------------------------
@@ -277,8 +265,6 @@ preload = $WALLPAPER_TARGET
 wallpaper = ,$WALLPAPER_TARGET
 EOF
 fi
-# Note: swww needs no static config file - wallpaper is set via 'swww img'
-# at runtime, which the picker script below handles for either daemon.
 
 cat > "$HOME_DIR/.config/hypr/hypridle.conf" <<EOF
 general {
@@ -449,6 +435,156 @@ KEYBINDS
 chmod +x "$HOME_DIR/.local/bin/show-keybinds.sh"
 
 # ------------------------------------------------------------
+# Stage 9: Plymouth + LUKS splash + TTY autologin (HIGH RISK)
+# ------------------------------------------------------------
+echo
+warn "=================================================================="
+warn " STAGE 9: BOOT-CRITICAL CHANGES AHEAD"
+warn "=================================================================="
+echo "This stage modifies /etc/mkinitcpio.conf, rebuilds your initramfs,"
+echo "and edits your Limine boot entry. A mistake here can leave the"
+echo "system unable to boot."
+echo
+echo "Before continuing, confirm you have:"
+echo "  1. A backup of /etc/mkinitcpio.conf"
+echo "  2. A backup of your Limine config file"
+echo "  3. A live USB (Arch ISO or similar) available to chroot and"
+echo "     repair the system if something goes wrong"
+echo
+if ! confirm "Do you have all THREE of the above ready?"; then
+  err "Aborting Stage 9. Re-run this script later once you're prepared -"
+  err "everything up to this point (Stages 0-8b) is already installed and safe."
+  exit 1
+fi
+
+log "Backing up mkinitcpio.conf"
+sudo cp /etc/mkinitcpio.conf /etc/mkinitcpio.conf.bak.$(date +%s)
+
+LIMINE_CONF=""
+for candidate in /boot/limine.conf /boot/limine.cfg /boot/EFI/limine/limine.conf; do
+  if [ -f "$candidate" ]; then
+    LIMINE_CONF="$candidate"
+    break
+  fi
+done
+
+if [ -z "$LIMINE_CONF" ]; then
+  err "Could not auto-locate your Limine config file."
+  read -rp "Enter the full path to your limine.conf/limine.cfg: " LIMINE_CONF
+  if [ ! -f "$LIMINE_CONF" ]; then
+    err "That path doesn't exist. Aborting Stage 9."
+    exit 1
+  fi
+fi
+
+log "Found Limine config: $LIMINE_CONF"
+sudo cp "$LIMINE_CONF" "${LIMINE_CONF}.bak.$(date +%s)"
+log "Backed up to ${LIMINE_CONF}.bak.*"
+
+echo
+log "Your current mkinitcpio HOOKS line:"
+grep "^HOOKS=" /etc/mkinitcpio.conf
+echo
+warn "Plymouth must be inserted BEFORE your encrypt/sd-encrypt hook, and"
+warn "AFTER 'base udev'. This script will NOT guess your hook order for you."
+echo
+if ! confirm "Have you manually reviewed the HOOKS line above and are ready to edit it yourself?"; then
+  err "Aborting Stage 9. Edit /etc/mkinitcpio.conf HOOKS manually, adding"
+  err "'plymouth' immediately before your encrypt hook, then re-run this"
+  err "script - it will detect the manual edit and skip re-prompting if"
+  err "'plymouth' is already present in HOOKS."
+  exit 1
+fi
+
+if grep -q "plymouth" /etc/mkinitcpio.conf; then
+  log "'plymouth' already present in HOOKS, skipping manual edit step."
+else
+  sudo nano /etc/mkinitcpio.conf
+  echo
+  if ! grep -q "plymouth" /etc/mkinitcpio.conf; then
+    err "'plymouth' still not found in HOOKS after edit. Aborting - rebuilding"
+    err "initramfs without it would skip the splash entirely."
+    exit 1
+  fi
+  log "Confirmed 'plymouth' is now present in HOOKS."
+fi
+
+log "Installing plymouth and a theme"
+sudo pacman -S --needed --noconfirm plymouth
+
+if ! yay -S --noconfirm plymouth-theme-arch-elegant; then
+  warn "plymouth-theme-arch-elegant failed to build."
+  warn "Falling back to the default plymouth theme (spinner)."
+  PLYMOUTH_THEME="spinner"
+else
+  PLYMOUTH_THEME="arch-elegant"
+fi
+
+sudo plymouth-set-default-theme -R "$PLYMOUTH_THEME" || \
+  warn "Could not set theme via plymouth-set-default-theme, check manually with 'plymouth-set-default-theme -l'"
+
+log "Regenerating initramfs (this may take a minute)"
+sudo mkinitcpio -P
+
+echo
+log "Current Limine config kernel command line entries (cmdline/CMDLINE):"
+grep -iE "cmdline|CMDLINE" "$LIMINE_CONF" || warn "No cmdline lines found - check format manually"
+echo
+warn "You need to manually add 'splash' to the kernel cmdline in $LIMINE_CONF"
+warn "(alongside your existing rd.luks.name=... or cryptdevice=... parameters)."
+echo
+if confirm "Open $LIMINE_CONF now to add 'splash' to the cmdline?"; then
+  sudo nano "$LIMINE_CONF"
+else
+  warn "Skipped. You must add 'splash' manually before rebooting or the"
+  warn "Plymouth splash will not appear."
+fi
+
+# ------------------------------------------------------------
+# Stage 9b: TTY autologin (replaces SDDM login)
+# ------------------------------------------------------------
+echo
+log "Stage 9b: Configuring TTY1 autologin for $USER_NAME"
+
+sudo mkdir -p /etc/systemd/system/getty@tty1.service.d
+sudo tee /etc/systemd/system/getty@tty1.service.d/override.conf >/dev/null <<EOF
+[Service]
+ExecStart=
+ExecStart=-/usr/bin/agetty --autologin $USER_NAME --noclear %I \$TERM
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable getty@tty1.service
+
+PROFILE_FILE="$HOME_DIR/.bash_profile"
+if [ -f "$HOME_DIR/.zprofile" ]; then
+  PROFILE_FILE="$HOME_DIR/.zprofile"
+fi
+
+if ! grep -q "exec Hyprland" "$PROFILE_FILE" 2>/dev/null; then
+  cat >> "$PROFILE_FILE" <<'AUTOSTART'
+
+# Auto-start Hyprland on tty1 only, and only if not already in a
+# graphical session (prevents relaunch if you ssh in or switch TTYs)
+if [ -z "${WAYLAND_DISPLAY:-}" ] && [ -z "${DISPLAY:-}" ] && [ "$(tty)" = "/dev/tty1" ]; then
+  exec Hyprland
+fi
+AUTOSTART
+  log "Added Hyprland autostart to $PROFILE_FILE"
+else
+  log "Hyprland autostart already present in $PROFILE_FILE, skipping"
+fi
+
+warn "=================================================================="
+warn "SECURITY NOTE: SDDM has been removed. LUKS passphrase is now the"
+warn "ONLY prompt between power-on and a fully unlocked desktop session."
+warn "hyprlock (SUPER+L, and hypridle's 300s timeout) is the only"
+warn "protection for an already-running session. Adjust the hypridle"
+warn "timeout in ~/.config/hypr/hypridle.conf if 300s doesn't match your"
+warn "risk tolerance."
+warn "=================================================================="
+
+# ------------------------------------------------------------
 # Done
 # ------------------------------------------------------------
 echo
@@ -461,10 +597,16 @@ echo "  - Wallpaper picker: SUPER+SHIFT+W"
 echo "  - Keybind reference menu: SUPER+/ (show-keybinds.sh)"
 echo "  - Wallpaper source folder: ~/Pictures/wallpapers"
 echo "  - Shared wallpaper file: $WALLPAPER_TARGET"
+echo "  - SDDM: removed"
+echo "  - Plymouth theme: $PLYMOUTH_THEME"
+echo "  - TTY1 autologin -> exec Hyprland: enabled for $USER_NAME"
 echo
-warn "Next steps:"
-echo "  1. Reboot: sudo reboot"
-echo "  2. At SDDM, select the 'Hyprland' session and log in"
-echo "  3. Test SUPER+RETURN (terminal), SUPER+E (Nautilus), SUPER+SPACE (launcher),"
-echo "     SUPER+L (lock), SUPER+/ (keybind list)"
-echo "  4. Run nwg-look and qt5ct once to set matching GTK/Qt themes"
+warn "DO NOT reboot yet if you skipped adding 'splash' to $LIMINE_CONF."
+echo "Next steps:"
+echo "  1. Confirm 'splash' is in your Limine cmdline (see above)"
+echo "  2. Reboot: sudo reboot"
+echo "  3. Watch for the Plymouth splash + LUKS prompt during boot"
+echo "  4. If it fails to boot, use your live USB to chroot in and restore:"
+echo "     - /etc/mkinitcpio.conf.bak.* -> /etc/mkinitcpio.conf, then"
+echo "       'mkinitcpio -P' again"
+echo "     - ${LIMINE_CONF}.bak.* -> $LIMINE_CONF"
