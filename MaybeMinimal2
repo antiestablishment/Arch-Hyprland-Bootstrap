@@ -1,0 +1,1228 @@
+#!/usr/bin/env bash
+#
+# Arch Linux + Hyprland Bootstrap
+#
+# Purpose:
+#   Turn a plain Arch Linux installation into a minimal, usable Hyprland
+#   desktop that you can customise yourself.
+#
+# Login behaviour:
+#   - You still log in normally at tty1.
+#   - After successful login, Hyprland starts automatically.
+#   - No automatic login.
+#   - No display manager.
+#
+# This script does NOT:
+#   - repartition disks
+#   - modify your bootloader
+#   - configure Btrfs/Snapper
+#   - install Plymouth
+#   - install a theme
+#   - replace existing configuration without making a backup
+#
+# Usage:
+#   chmod +x hyprland-bootstrap.sh
+#   ./hyprland-bootstrap.sh
+#
+# ---------------------------------------------------------------------------
+
+set -Eeuo pipefail
+
+SCRIPT_NAME="$(basename "$0")"
+
+trap 'echo; echo "ERROR: $SCRIPT_NAME failed at line $LINENO."; exit 1' ERR
+
+# ===========================================================================
+# Helpers
+# ===========================================================================
+
+log() {
+    printf '\n\033[1;34m==>\033[0m %s\n' "$*"
+}
+
+warn() {
+    printf '\033[1;33mWARNING:\033[0m %s\n' "$*" >&2
+}
+
+die() {
+    printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2
+    exit 1
+}
+
+backup_file() {
+    local file="$1"
+
+    if [[ -e "$file" ]]; then
+        local backup="${file}.backup.$(date +%Y%m%d-%H%M%S)"
+
+        cp -a "$file" "$backup"
+
+        echo "Backed up:"
+        echo "  $file"
+        echo "  -> $backup"
+    fi
+}
+
+append_if_missing() {
+    local file="$1"
+    local marker="$2"
+    local content="$3"
+
+    touch "$file"
+
+    if ! grep -Fq "$marker" "$file"; then
+        printf '\n%s\n' "$content" >> "$file"
+    fi
+}
+
+# ===========================================================================
+# Checks
+# ===========================================================================
+
+if [[ "$EUID" -eq 0 ]]; then
+    die "Do not run this script as root. Run it as your normal user."
+fi
+
+command -v pacman >/dev/null 2>&1 ||
+    die "This script is intended for Arch Linux."
+
+command -v sudo >/dev/null 2>&1 ||
+    die "sudo is required."
+
+sudo -v
+
+USER_NAME="$USER"
+USER_HOME="$HOME"
+
+log "Arch Linux + Hyprland bootstrap"
+
+echo
+echo "This will install a minimal Hyprland desktop."
+echo
+echo "After installation:"
+echo
+echo "  Boot -> tty1 -> log in -> Hyprland starts"
+echo
+echo "It will NOT:"
+echo "  - automatically log you in"
+echo "  - install a display manager"
+echo "  - modify your bootloader"
+echo "  - repartition your disks"
+echo "  - install a desktop theme"
+echo
+read -r -p "Continue? [y/N] " answer
+
+[[ "$answer" =~ ^[Yy]$ ]] || exit 0
+
+# ===========================================================================
+# Packages
+# ===========================================================================
+
+log "Installing Hyprland desktop packages"
+
+PACKAGES=(
+    # -----------------------------------------------------------------------
+    # Hyprland
+    # -----------------------------------------------------------------------
+
+    hyprland
+    hyprlock
+    hypridle
+
+    # UWSM provides systemd-managed Wayland sessions and is the current
+    # recommended approach for systemd-based Hyprland sessions.
+    uwsm
+    libnewt
+
+    # -----------------------------------------------------------------------
+    # Desktop components
+    # -----------------------------------------------------------------------
+
+    waybar
+    fuzzel
+    mako
+    foot
+
+    # -----------------------------------------------------------------------
+    # Wayland / desktop integration
+    # -----------------------------------------------------------------------
+
+    xdg-desktop-portal
+    xdg-desktop-portal-hyprland
+    xdg-desktop-portal-gtk
+
+    # -----------------------------------------------------------------------
+    # Authentication
+    # -----------------------------------------------------------------------
+
+    polkit
+    polkit-gnome
+
+    # -----------------------------------------------------------------------
+    # Audio
+    # -----------------------------------------------------------------------
+
+    pipewire
+    pipewire-alsa
+    pipewire-pulse
+    wireplumber
+    pavucontrol
+
+    # -----------------------------------------------------------------------
+    # Network
+    # -----------------------------------------------------------------------
+
+    networkmanager
+    network-manager-applet
+
+    # -----------------------------------------------------------------------
+    # Bluetooth
+    # -----------------------------------------------------------------------
+
+    bluez
+    bluez-utils
+    blueman
+
+    # -----------------------------------------------------------------------
+    # Hardware/media controls
+    # -----------------------------------------------------------------------
+
+    brightnessctl
+    playerctl
+
+    # -----------------------------------------------------------------------
+    # Screenshots
+    # -----------------------------------------------------------------------
+
+    grim
+    slurp
+
+    # -----------------------------------------------------------------------
+    # Clipboard
+    # -----------------------------------------------------------------------
+
+    wl-clipboard
+    cliphist
+
+    # -----------------------------------------------------------------------
+    # Notifications
+    # -----------------------------------------------------------------------
+
+    libnotify
+
+    # -----------------------------------------------------------------------
+    # Useful utilities
+    # -----------------------------------------------------------------------
+
+    jq
+    wev
+
+    # -----------------------------------------------------------------------
+    # Fonts
+    # -----------------------------------------------------------------------
+
+    noto-fonts
+    noto-fonts-emoji
+    ttf-dejavu
+    ttf-jetbrains-mono-nerd
+)
+
+sudo pacman -Syu --needed "${PACKAGES[@]}"
+
+# ===========================================================================
+# Services
+# ===========================================================================
+
+log "Enabling NetworkManager"
+
+sudo systemctl enable --now NetworkManager.service
+
+log "Enabling Bluetooth"
+
+sudo systemctl enable --now bluetooth.service
+
+log "Starting PipeWire"
+
+systemctl --user enable --now pipewire.socket
+systemctl --user enable --now pipewire-pulse.socket
+systemctl --user enable --now wireplumber.service
+
+# ===========================================================================
+# Directories
+# ===========================================================================
+
+log "Creating configuration directories"
+
+mkdir -p \
+    "$USER_HOME/.config/hypr" \
+    "$USER_HOME/.config/fuzzel" \
+    "$USER_HOME/.config/mako" \
+    "$USER_HOME/.config/waybar" \
+    "$USER_HOME/.config/foot" \
+    "$USER_HOME/.local/bin" \
+    "$USER_HOME/Pictures/Screenshots"
+
+# ===========================================================================
+# Hyprland Lua configuration
+# ===========================================================================
+
+HYPR="$USER_HOME/.config/hypr"
+
+if [[ -e "$HYPR/hyprland.lua" ]]; then
+    backup_file "$HYPR/hyprland.lua"
+fi
+
+log "Installing Hyprland Lua configuration"
+
+cat > "$HYPR/hyprland.lua" <<'EOF'
+-- ============================================================================
+-- Hyprland configuration
+--
+-- Current Hyprland uses Lua configuration.
+--
+-- Files:
+--
+--   hyprland.lua       Main configuration
+--   keybinds.lua       Keyboard / mouse shortcuts
+--   personal.lua       Your personal customisations
+--   hypridle.conf      Idle behaviour
+--   hyprlock.conf      Lock screen
+--
+-- The configuration is intentionally neutral.
+-- Make this desktop yours.
+-- ============================================================================
+
+local mainMod = "SUPER"
+
+-- ============================================================================
+-- Input
+-- ============================================================================
+
+hl.config({
+    input = {
+        kb_layout = "gb",
+        follow_mouse = 1,
+
+        touchpad = {
+            natural_scroll = true,
+            tap_to_click = true,
+            disable_while_typing = true,
+        },
+    },
+})
+
+-- ============================================================================
+-- Monitor
+-- ============================================================================
+
+-- "preferred" uses the monitor's preferred mode.
+--
+-- Once you know your monitor name/resolution, this is a good place to
+-- customise it.
+--
+-- Example:
+--
+-- hl.config({
+--     monitor = "DP-1, 2560x1440@144, 0x0, 1",
+-- })
+
+-- ============================================================================
+-- General
+-- ============================================================================
+
+hl.config({
+    general = {
+        gaps_in = 5,
+        gaps_out = 10,
+
+        border_size = 2,
+
+        layout = "dwindle",
+
+        col = {
+            active_border = "rgb(888888)",
+            inactive_border = "rgb(444444)",
+        },
+    },
+})
+
+-- ============================================================================
+-- Decoration
+-- ============================================================================
+
+hl.config({
+    decoration = {
+        rounding = 6,
+
+        blur = {
+            enabled = true,
+            size = 3,
+            passes = 2,
+        },
+
+        shadow = {
+            enabled = true,
+            range = 10,
+            render_power = 2,
+        },
+    },
+})
+
+-- ============================================================================
+-- Animations
+-- ============================================================================
+
+hl.config({
+    animations = {
+        enabled = true,
+
+        bezier = {
+            {
+                name = "default",
+                x0 = 0.2,
+                y0 = 0.8,
+                x1 = 0.2,
+                y1 = 1.0,
+            },
+        },
+
+        animation = {
+            {
+                name = "windows",
+                duration = 3,
+                curve = "default",
+            },
+            {
+                name = "fade",
+                duration = 3,
+                curve = "default",
+            },
+            {
+                name = "workspaces",
+                duration = 3,
+                curve = "default",
+            },
+        },
+    },
+})
+
+-- ============================================================================
+-- Dwindle
+-- ============================================================================
+
+hl.config({
+    dwindle = {
+        pseudotile = true,
+        preserve_split = true,
+    },
+})
+
+-- ============================================================================
+-- Miscellaneous
+-- ============================================================================
+
+hl.config({
+    misc = {
+        disable_hyprland_logo = true,
+        disable_splash_rendering = true,
+    },
+})
+
+-- ============================================================================
+-- Environment
+-- ============================================================================
+
+hl.config({
+    env = {
+        "XCURSOR_SIZE,24",
+    },
+})
+
+-- ============================================================================
+-- Autostart
+-- ============================================================================
+
+-- These are deliberately simple.
+--
+-- Once you start customising the desktop, this is one of the first places
+-- you may want to change.
+--
+-- Current Hyprland recommends using the hyprland.start event for
+-- autostarting applications.
+
+hl.on("hyprland.start", function()
+    hl.dsp.exec_cmd("waybar")
+    hl.dsp.exec_cmd("mako")
+    hl.dsp.exec_cmd("hypridle")
+
+    hl.dsp.exec_cmd(
+        "wl-paste --type text --watch cliphist store"
+    )
+
+    hl.dsp.exec_cmd(
+        "wl-paste --type image --watch cliphist store"
+    )
+
+    hl.dsp.exec_cmd(
+        "/usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1"
+    )
+end)
+
+-- ============================================================================
+-- Keybindings
+-- ============================================================================
+
+dofile(os.getenv("HOME") .. "/.config/hypr/keybinds.lua")
+
+-- ============================================================================
+-- Personal configuration
+-- ============================================================================
+
+local personal = os.getenv("HOME") .. "/.config/hypr/personal.lua"
+
+local file = io.open(personal, "r")
+
+if file then
+    file:close()
+    dofile(personal)
+end
+EOF
+
+# ===========================================================================
+# Keybindings
+# ===========================================================================
+
+if [[ -e "$HYPR/keybinds.lua" ]]; then
+    backup_file "$HYPR/keybinds.lua"
+fi
+
+log "Installing Hyprland keybindings"
+
+cat > "$HYPR/keybinds.lua" <<'EOF'
+-- ============================================================================
+-- Hyprland keybindings
+--
+-- SUPER = Windows / Meta key
+--
+-- This is intended to be customised.
+-- ============================================================================
+
+local mainMod = "SUPER"
+
+-- ============================================================================
+-- Applications
+-- ============================================================================
+
+hl.bind(
+    mainMod .. " + RETURN",
+    hl.dsp.exec_cmd("foot"),
+    { description = "Open terminal" }
+)
+
+hl.bind(
+    mainMod .. " + D",
+    hl.dsp.exec_cmd("fuzzel"),
+    { description = "Open application launcher" }
+)
+
+hl.bind(
+    mainMod .. " + B",
+    hl.dsp.exec_cmd("firefox"),
+    { description = "Open browser" }
+)
+
+hl.bind(
+    mainMod .. " + E",
+    hl.dsp.exec_cmd("foot -e yazi"),
+    { description = "Open file manager" }
+)
+
+-- ============================================================================
+-- Window management
+-- ============================================================================
+
+hl.bind(
+    mainMod .. " + Q",
+    hl.dsp.window.kill(),
+    { description = "Close active window" }
+)
+
+hl.bind(
+    mainMod .. " + F",
+    hl.dsp.window.fullscreen(),
+    { description = "Toggle fullscreen" }
+)
+
+hl.bind(
+    mainMod .. " + SPACE",
+    hl.dsp.window.float({ action = "toggle" }),
+    { description = "Toggle floating" }
+)
+
+hl.bind(
+    mainMod .. " + P",
+    hl.dsp.window.pseudo({ action = "toggle" }),
+    { description = "Toggle pseudotile" }
+)
+
+-- ============================================================================
+-- Focus
+-- ============================================================================
+
+hl.bind(
+    mainMod .. " + LEFT",
+    hl.dsp.window.focus("l"),
+    { description = "Focus left" }
+)
+
+hl.bind(
+    mainMod .. " + RIGHT",
+    hl.dsp.window.focus("r"),
+    { description = "Focus right" }
+)
+
+hl.bind(
+    mainMod .. " + UP",
+    hl.dsp.window.focus("u"),
+    { description = "Focus up" }
+)
+
+hl.bind(
+    mainMod .. " + DOWN",
+    hl.dsp.window.focus("d"),
+    { description = "Focus down" }
+)
+
+-- ============================================================================
+-- Move windows
+-- ============================================================================
+
+hl.bind(
+    mainMod .. " + SHIFT + LEFT",
+    hl.dsp.window.move("l"),
+    { description = "Move window left" }
+)
+
+hl.bind(
+    mainMod .. " + SHIFT + RIGHT",
+    hl.dsp.window.move("r"),
+    { description = "Move window right" }
+)
+
+hl.bind(
+    mainMod .. " + SHIFT + UP",
+    hl.dsp.window.move("u"),
+    { description = "Move window up" }
+)
+
+hl.bind(
+    mainMod .. " + SHIFT + DOWN",
+    hl.dsp.window.move("d"),
+    { description = "Move window down" }
+)
+
+-- ============================================================================
+-- Clipboard
+-- ============================================================================
+
+hl.bind(
+    mainMod .. " + V",
+    hl.dsp.exec_cmd(
+        "cliphist list | fuzzel --dmenu | cliphist decode | wl-copy"
+    ),
+    { description = "Clipboard history" }
+)
+
+-- ============================================================================
+-- Screenshot
+-- ============================================================================
+
+hl.bind(
+    "PRINT",
+    hl.dsp.exec_cmd("hypr-screenshot"),
+    { description = "Screenshot selection" }
+)
+
+-- ============================================================================
+-- Lock screen
+-- ============================================================================
+
+hl.bind(
+    mainMod .. " + CTRL + L",
+    hl.dsp.exec_cmd("loginctl lock-session"),
+    { description = "Lock screen" }
+)
+
+-- ============================================================================
+-- Reload configuration
+-- ============================================================================
+
+hl.bind(
+    mainMod .. " + SHIFT + R",
+    hl.dsp.exec_cmd("hyprctl reload"),
+    { description = "Reload Hyprland configuration" }
+)
+
+-- ============================================================================
+-- Workspace switching
+-- ============================================================================
+
+for i = 1, 9 do
+    hl.bind(
+        mainMod .. " + " .. i,
+        hl.dsp.workspace(tostring(i)),
+        { description = "Switch to workspace " .. i }
+    )
+
+    hl.bind(
+        mainMod .. " + SHIFT + " .. i,
+        hl.dsp.movetoworkspace(tostring(i)),
+        { description = "Move window to workspace " .. i }
+    )
+end
+
+-- Workspace 10 = SUPER + 0
+
+hl.bind(
+    mainMod .. " + 0",
+    hl.dsp.workspace("10"),
+    { description = "Switch to workspace 10" }
+)
+
+hl.bind(
+    mainMod .. " + SHIFT + 0",
+    hl.dsp.movetoworkspace("10"),
+    { description = "Move window to workspace 10" }
+)
+
+-- ============================================================================
+-- Workspace scrolling
+-- ============================================================================
+
+hl.bind(
+    mainMod .. " + mouse_down",
+    hl.dsp.workspace("e+1"),
+    { description = "Next workspace" }
+)
+
+hl.bind(
+    mainMod .. " + mouse_up",
+    hl.dsp.workspace("e-1"),
+    { description = "Previous workspace" }
+)
+
+-- ============================================================================
+-- Mouse window movement
+-- ============================================================================
+
+hl.bind(
+    mainMod .. " + mouse:272",
+    hl.dsp.window.move(),
+    { mouse = true, description = "Move window with mouse" }
+)
+
+hl.bind(
+    mainMod .. " + mouse:273",
+    hl.dsp.window.resize(),
+    { mouse = true, description = "Resize window with mouse" }
+)
+
+-- ============================================================================
+-- Audio
+-- ============================================================================
+
+hl.bind(
+    "XF86AudioRaiseVolume",
+    hl.dsp.exec_cmd(
+        "wpctl set-volume -l 1 @DEFAULT_AUDIO_SINK@ 5%+"
+    ),
+    { repeating = true, description = "Volume up" }
+)
+
+hl.bind(
+    "XF86AudioLowerVolume",
+    hl.dsp.exec_cmd(
+        "wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-"
+    ),
+    { repeating = true, description = "Volume down" }
+)
+
+hl.bind(
+    "XF86AudioMute",
+    hl.dsp.exec_cmd(
+        "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle"
+    ),
+    { locked = true, description = "Mute audio" }
+)
+
+hl.bind(
+    "XF86AudioMicMute",
+    hl.dsp.exec_cmd(
+        "wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle"
+    ),
+    { locked = true, description = "Mute microphone" }
+)
+
+-- ============================================================================
+-- Brightness
+-- ============================================================================
+
+hl.bind(
+    "XF86MonBrightnessUp",
+    hl.dsp.exec_cmd("brightnessctl set +5%"),
+    { repeating = true, description = "Brightness up" }
+)
+
+hl.bind(
+    "XF86MonBrightnessDown",
+    hl.dsp.exec_cmd("brightnessctl set 5%-"),
+    { repeating = true, description = "Brightness down" }
+)
+
+-- ============================================================================
+-- Media
+-- ============================================================================
+
+hl.bind(
+    "XF86AudioPlay",
+    hl.dsp.exec_cmd("playerctl play-pause"),
+    { locked = true, description = "Play / pause" }
+)
+
+hl.bind(
+    "XF86AudioNext",
+    hl.dsp.exec_cmd("playerctl next"),
+    { locked = true, description = "Next track" }
+)
+
+hl.bind(
+    "XF86AudioPrev",
+    hl.dsp.exec_cmd("playerctl previous"),
+    { locked = true, description = "Previous track" }
+)
+EOF
+
+# ===========================================================================
+# Personal configuration
+# ===========================================================================
+
+if [[ ! -e "$HYPR/personal.lua" ]]; then
+    log "Creating personal Hyprland configuration"
+
+    cat > "$HYPR/personal.lua" <<'EOF'
+-- ============================================================================
+-- Personal Hyprland configuration
+--
+-- Put your own configuration here.
+--
+-- This file is intentionally sparse.
+--
+-- Examples:
+--
+-- Monitor:
+--
+-- hl.config({
+--     monitor = "DP-1, 2560x1440@144, 0x0, 1",
+-- })
+--
+-- Colours:
+--
+-- hl.config({
+--     general = {
+--         col = {
+--             active_border = "#ffffff",
+--             inactive_border = "#444444",
+--         },
+--     },
+-- })
+--
+-- Window rules:
+--
+-- See the current Hyprland documentation for Lua window rules.
+--
+-- ============================================================================
+
+-- Your configuration goes here.
+EOF
+else
+    echo "Existing personal.lua found; leaving it untouched."
+fi
+
+# ===========================================================================
+# Hypridle
+# ===========================================================================
+
+if [[ -e "$HYPR/hypridle.conf" ]]; then
+    backup_file "$HYPR/hypridle.conf"
+fi
+
+log "Installing Hypridle configuration"
+
+cat > "$HYPR/hypridle.conf" <<'EOF'
+general {
+    lock_cmd = pidof hyprlock || hyprlock
+    before_sleep_cmd = loginctl lock-session
+    after_sleep_cmd = hyprctl dispatch dpms on
+}
+
+# Lock after 5 minutes.
+listener {
+    timeout = 300
+    on-timeout = loginctl lock-session
+}
+
+# Turn displays off after 6 minutes.
+listener {
+    timeout = 360
+    on-timeout = hyprctl dispatch dpms off
+    on-resume = hyprctl dispatch dpms on
+}
+EOF
+
+# ===========================================================================
+# Hyprlock
+# ===========================================================================
+
+if [[ ! -e "$HYPR/hyprlock.conf" ]]; then
+    log "Creating minimal Hyprlock configuration"
+
+    cat > "$HYPR/hyprlock.conf" <<'EOF'
+general {
+    hide_cursor = true
+}
+
+background {
+    monitor =
+    color = rgb(111111)
+}
+
+input-field {
+    monitor =
+
+    size = 300, 55
+    outline_thickness = 2
+
+    outer_color = rgb(888888)
+    inner_color = rgb(222222)
+
+    font_color = rgb(ffffff)
+
+    placeholder_text = <i>Enter password...</i>
+
+    position = 0, 0
+    halign = center
+    valign = center
+}
+EOF
+else
+    echo "Existing hyprlock.conf found; leaving it untouched."
+fi
+
+# ===========================================================================
+# Fuzzel
+# ===========================================================================
+
+if [[ ! -e "$USER_HOME/.config/fuzzel/fuzzel.ini" ]]; then
+    log "Creating Fuzzel configuration"
+
+    cat > "$USER_HOME/.config/fuzzel/fuzzel.ini" <<'EOF'
+[main]
+font=JetBrainsMono Nerd Font:size=11
+width=40
+lines=12
+terminal=foot -e
+
+[border]
+width=2
+radius=6
+EOF
+else
+    echo "Existing fuzzel.ini found; leaving it untouched."
+fi
+
+# ===========================================================================
+# Mako
+# ===========================================================================
+
+if [[ ! -e "$USER_HOME/.config/mako/config" ]]; then
+    log "Creating Mako configuration"
+
+    cat > "$USER_HOME/.config/mako/config" <<'EOF'
+font=JetBrainsMono Nerd Font 11
+
+background-color=#222222
+text-color=#ffffff
+
+border-color=#888888
+border-size=2
+border-radius=6
+
+padding=10
+default-timeout=5000
+EOF
+else
+    echo "Existing Mako configuration found; leaving it untouched."
+fi
+
+# ===========================================================================
+# Foot
+# ===========================================================================
+
+if [[ ! -e "$USER_HOME/.config/foot/foot.ini" ]]; then
+    log "Creating Foot configuration"
+
+    cat > "$USER_HOME/.config/foot/foot.ini" <<'EOF'
+[main]
+font=JetBrainsMono Nerd Font:size=11
+pad=8x8
+
+[scrollback]
+lines=10000
+EOF
+else
+    echo "Existing foot.ini found; leaving it untouched."
+fi
+
+# ===========================================================================
+# Waybar
+# ===========================================================================
+
+if [[ ! -e "$USER_HOME/.config/waybar/config.jsonc" ]]; then
+    log "Creating Waybar configuration"
+
+    cat > "$USER_HOME/.config/waybar/config.jsonc" <<'EOF'
+{
+    "layer": "top",
+    "position": "top",
+
+    "modules-left": [
+        "hyprland/workspaces"
+    ],
+
+    "modules-center": [
+        "clock"
+    ],
+
+    "modules-right": [
+        "network",
+        "pulseaudio",
+        "battery",
+        "tray"
+    ],
+
+    "hyprland/workspaces": {
+        "format": "{name}",
+        "on-click": "activate"
+    },
+
+    "clock": {
+        "format": "{:%a %d %b %H:%M}"
+    },
+
+    "network": {
+        "format-wifi": "{essid} {signalStrength}%",
+        "format-ethernet": "Ethernet",
+        "format-disconnected": "Offline"
+    },
+
+    "pulseaudio": {
+        "format": "󰕾 {volume}%",
+        "format-muted": "󰖁 Muted"
+    },
+
+    "battery": {
+        "format": "{capacity}%"
+    },
+
+    "tray": {
+        "spacing": 8
+    }
+}
+EOF
+else
+    echo "Existing Waybar config found; leaving it untouched."
+fi
+
+if [[ ! -e "$USER_HOME/.config/waybar/style.css" ]]; then
+    log "Creating neutral Waybar stylesheet"
+
+    cat > "$USER_HOME/.config/waybar/style.css" <<'EOF'
+/*
+ * Minimal neutral Waybar stylesheet.
+ *
+ * This is deliberately boring.
+ * Change it to create your own desktop aesthetic.
+ */
+
+* {
+    font-family: "JetBrainsMono Nerd Font";
+    font-size: 12px;
+}
+
+window#waybar {
+    background: rgba(20, 20, 20, 0.90);
+    color: #ffffff;
+}
+
+#workspaces button {
+    padding: 0 8px;
+    color: #aaaaaa;
+}
+
+#workspaces button.active {
+    color: #ffffff;
+}
+
+#clock,
+#network,
+#pulseaudio,
+#battery,
+#tray {
+    padding: 0 8px;
+}
+EOF
+else
+    echo "Existing Waybar stylesheet found; leaving it untouched."
+fi
+
+# ===========================================================================
+# Screenshot helper
+# ===========================================================================
+
+log "Installing screenshot helper"
+
+cat > "$USER_HOME/.local/bin/hypr-screenshot" <<'EOF'
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+mkdir -p "$HOME/Pictures/Screenshots"
+
+region="$(slurp)" || exit 0
+
+file="$HOME/Pictures/Screenshots/$(date +%Y%m%d-%H%M%S).png"
+
+grim -g "$region" "$file"
+
+wl-copy --type image/png < "$file"
+
+notify-send \
+    "Screenshot saved" \
+    "$file"
+EOF
+
+chmod +x "$USER_HOME/.local/bin/hypr-screenshot"
+
+# ===========================================================================
+# TTY1 -> Hyprland startup
+# ===========================================================================
+
+log "Configuring Hyprland to start after tty1 login"
+
+BASH_PROFILE="$USER_HOME/.bash_profile"
+
+touch "$BASH_PROFILE"
+
+append_if_missing \
+    "$BASH_PROFILE" \
+    "# ARCH-HYPRLAND-BOOTSTRAP" \
+    '# ARCH-HYPRLAND-BOOTSTRAP
+#
+# Start Hyprland automatically after the user logs into tty1.
+#
+# This does NOT automatically log the user in.
+# The user must still enter their username and password.
+
+if [[ "$(tty)" == "/dev/tty1" ]] && uwsm check may-start >/dev/null 2>&1; then
+    exec uwsm start hyprland.desktop
+fi'
+
+# ===========================================================================
+# Local PATH
+# ===========================================================================
+
+log "Configuring local executable PATH"
+
+append_if_missing \
+    "$USER_HOME/.bashrc" \
+    "# ARCH-HYPRLAND-LOCAL-BIN" \
+    '# ARCH-HYPRLAND-LOCAL-BIN
+export PATH="$HOME/.local/bin:$PATH"'
+
+# ===========================================================================
+# Permissions
+# ===========================================================================
+
+log "Fixing configuration ownership"
+
+sudo chown -R "$USER_NAME:$(id -gn)" \
+    "$USER_HOME/.config/hypr" \
+    "$USER_HOME/.config/fuzzel" \
+    "$USER_HOME/.config/mako" \
+    "$USER_HOME/.config/waybar" \
+    "$USER_HOME/.config/foot" \
+    "$USER_HOME/.local/bin" \
+    "$BASH_PROFILE"
+
+# ===========================================================================
+# Configuration summary
+# ===========================================================================
+
+echo
+echo "=============================================================="
+echo " Hyprland bootstrap complete"
+echo "=============================================================="
+echo
+echo "Installed:"
+echo
+echo "  Hyprland"
+echo "  UWSM"
+echo "  Hyprlock"
+echo "  Hypridle"
+echo "  Waybar"
+echo "  Fuzzel"
+echo "  Mako"
+echo "  Foot"
+echo "  PipeWire / WirePlumber"
+echo "  NetworkManager"
+echo "  Bluetooth"
+echo "  wl-clipboard / cliphist"
+echo "  grim / slurp"
+echo
+echo "Hyprland configuration:"
+echo
+echo "  ~/.config/hypr/hyprland.lua"
+echo "  ~/.config/hypr/keybinds.lua"
+echo "  ~/.config/hypr/personal.lua"
+echo "  ~/.config/hypr/hypridle.conf"
+echo "  ~/.config/hypr/hyprlock.conf"
+echo
+echo "Other configuration:"
+echo
+echo "  ~/.config/waybar/"
+echo "  ~/.config/fuzzel/"
+echo "  ~/.config/mako/"
+echo "  ~/.config/foot/"
+echo
+echo "Startup:"
+echo
+echo "  Boot normally."
+echo "  Log in at tty1."
+echo "  Hyprland will start automatically."
+echo
+echo "There is NO automatic login."
+echo "There is NO display manager."
+echo
+echo "Useful commands once inside Hyprland:"
+echo
+echo "  hyprctl monitors"
+echo "  hyprctl clients"
+echo "  hyprctl binds"
+echo "  hyprctl reload"
+echo
+echo "Your main customisation file is:"
+echo
+echo "  ~/.config/hypr/personal.lua"
+echo
+echo "Reboot when ready."
+echo
